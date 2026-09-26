@@ -47,10 +47,13 @@ if (!MOCK && (!ADEX_PUBLIC_KEY || !ADEX_SECRET_KEY)) {
 const app = express();
 app.set("trust proxy", 1);
 
+/* ALLOWED_ORIGINS: domínios do site separados por vírgula, ou "*" para aceitar qualquer
+   site (o dono pediu para não amarrar a um domínio; o preço é sempre definido aqui). */
 const allowedOrigins = ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
+const anyOrigin = allowedOrigins.includes("*");
 app.use(
   cors({
-    origin: (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin)),
+    origin: (origin, cb) => cb(null, anyOrigin || !origin || allowedOrigins.includes(origin)),
     methods: ["GET", "POST"],
   })
 );
