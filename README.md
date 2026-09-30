@@ -1,6 +1,6 @@
 # api-capa-de-sofa
 
-Backend do checkout Pix da **Capa de Sofá Vicenza — Leve 2 Pague 1** (gateway ADEX). Guarda as chaves da ADEX e a tabela de preços. O navegador nunca vê as chaves e nunca decide o valor.
+Backend do checkout Pix da **Capa de Sofá — Leve 2 Pague 1** (gateway ADEX). Guarda as chaves da ADEX e a tabela de preços. O navegador nunca vê as chaves e nunca decide o valor.
 
 ## Oferta (definida em `server.js`)
 
@@ -26,7 +26,7 @@ Cores: `cinza`, `vermelho`, `marrom`. Quantidade: 1 a 5 kits.
 
 ## Variáveis de ambiente (Railway → Variables)
 
-Veja `.env.example`. Obrigatórias: `ADEX_PUBLIC_KEY`, `ADEX_SECRET_KEY`, `ALLOWED_ORIGINS`, `PORT=8080`. Recomendadas: `ADEX_WEBHOOK_SECRET`, `PUBLIC_API_URL`, `UTMIFY_API_TOKEN`.
+Veja `.env.example`. Obrigatórias: `ADEX_PUBLIC_KEY`, `ADEX_SECRET_KEY`, `ALLOWED_ORIGINS`, `PORT=8080`. Recomendadas: `ADEX_WEBHOOK_SECRET`, `PUBLIC_API_URL`, `UTMIFY_API_TOKEN`. **`UTMIFY_TEST=false` é obrigatória para as vendas contarem na UTMify** (sem ela, tudo vai como teste).
 
 ## Rodar local
 

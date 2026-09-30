@@ -2,7 +2,7 @@
   "name": "api-capa-de-sofa",
   "version": "1.0.0",
   "private": true,
-  "description": "Backend do checkout Pix da Capa de Sofá Vicenza (gateway ADEX)",
+  "description": "Backend do checkout Pix da Capa de Sofá (gateway ADEX)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

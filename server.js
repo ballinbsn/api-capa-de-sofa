@@ -20,9 +20,9 @@ const ADEX_BASE = "https://api.adex.cash/functions/v1";
 const MOCK = MOCK_ADEX === "true";
 
 /* Oferta fixa no servidor: o navegador nunca decide preço.
-   Kit "Leve 2 Pague 1": 2 capas de sofá Vicenza (cores escolhidas) + 2 almofadas inclusas.
+   Kit "Leve 2 Pague 1": 2 capas de sofá (cores escolhidas) + 2 almofadas inclusas.
    O preço do kit depende só do tamanho. */
-const PRODUCT_NAME = "Capa de Sofá Vicenza";
+const PRODUCT_NAME = "Capa de Sofá em Algodão";
 const SIZES = {
   2: { label: "2 Assentos", cents: 8790 },
   3: { label: "3 Assentos", cents: 8790 },
@@ -376,7 +376,7 @@ function orderFromWebhook(data, timestamp) {
     createdAt: t,
     order: {
       name: data.customer_name || "Cliente",
-      email: data.customer_email || "cliente@pontodelas.com",
+      email: data.customer_email || "cliente@example.com",
       phone: data.customer_phone || "",
       cpf: data.customer_document || "",
       kit: null,
@@ -405,10 +405,12 @@ async function sendUtmify(id, status, fallbackOrder) {
   const t = o.tracking || {};
   const kit = o.order.kit;
   const totalCents = kit ? kitTotalCents(kit) : o.order.totalCents || 0;
-  const isTest = UTMIFY_TEST === "true" || String(ADEX_PUBLIC_KEY || "").startsWith("pk_test_");
+  /* Venda só conta de verdade na UTMify com UTMIFY_TEST=false. O prefixo da chave da ADEX
+     não serve para isso: a chave de teste dela não começa com pk_test_. */
+  const isTest = UTMIFY_TEST !== "false";
   const body = {
     orderId: id,
-    platform: "PontoDelasCheckout",
+    platform: "LunaLarCheckout",
     paymentMethod: "pix",
     status,
     createdAt: utcStamp(o.createdAt),
@@ -425,7 +427,7 @@ async function sendUtmify(id, status, fallbackOrder) {
     products: kit
       ? [
           {
-            id: `capa-vicenza-${kit.size}-${kit.color1}-${kit.color2}`,
+            id: `capa-sofa-${kit.size}-${kit.color1}-${kit.color2}`,
             name: kitTitle(kit),
             planId: null,
             planName: null,
@@ -435,7 +437,7 @@ async function sendUtmify(id, status, fallbackOrder) {
         ]
       : [
           {
-            id: "capa-vicenza-kit",
+            id: "capa-sofa-kit",
             name: `${PRODUCT_NAME} - kit 2 capas + 2 almofadas`,
             planId: null,
             planName: null,
