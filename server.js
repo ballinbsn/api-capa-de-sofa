@@ -18,6 +18,7 @@ const {
   DATABASE_URL,
   DATABASE_SSL,
   GOOGLE_ADS_FEED_TOKEN,
+  GOOGLE_ADS_FEED_USER = "googleads",
   PORT = 3000,
 } = process.env;
 
@@ -612,8 +613,11 @@ function sanitizeTracking(t) {
    Lista as vendas PAGAS desta loja (confirmadas pela ADEX) que têm gclid/gbraid/wbraid,
    dos últimos 90 dias. O Google Ads lê este arquivo por HTTPS em horário programado.
    Sem dados pessoais. O Google descarta repetições (mesma ação + data/hora + identificador)
-   e o Order ID impede contar a mesma venda duas vezes. Protegido por um token longo na URL
-   (variável GOOGLE_ADS_FEED_TOKEN, mínimo 32 caracteres); sem ele a rota não existe. */
+   e o Order ID impede contar a mesma venda duas vezes. Protegido pela senha GOOGLE_ADS_FEED_TOKEN
+   (mínimo 32 caracteres); sem ela a rota não existe.
+   - /api/google-ads/conversoes.csv → usuário e senha (HTTP Basic), como pede o Data Manager do Google Ads;
+     usuário = GOOGLE_ADS_FEED_USER (padrão "googleads"), senha = GOOGLE_ADS_FEED_TOKEN.
+   - /api/google-ads/conversoes/<GOOGLE_ADS_FEED_TOKEN>.csv → mesma lista, token na URL (conferência manual). */
 
 const csvCell = (v) => {
   const s = v === null || v === undefined ? "" : String(v);
@@ -645,8 +649,35 @@ function feedTokenOk(given) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function basicAuthOk(req) {
+  const m = /^Basic\s+(.+)$/i.exec(String(req.headers.authorization || ""));
+  if (!m) return false;
+  const raw = Buffer.from(m[1], "base64").toString("utf8");
+  const i = raw.indexOf(":");
+  if (i < 0) return false;
+  const ua = Buffer.from(raw.slice(0, i));
+  const ub = Buffer.from(GOOGLE_ADS_FEED_USER);
+  const userOk = ua.length === ub.length && crypto.timingSafeEqual(ua, ub);
+  return feedTokenOk(raw.slice(i + 1)) && userOk;
+}
+
+const feedOn = () => !!GOOGLE_ADS_FEED_TOKEN && GOOGLE_ADS_FEED_TOKEN.length >= 32 && store.enabled();
+
+app.get("/api/google-ads/conversoes.csv", rateLimit(60, 60 * 60 * 1000), async (req, res) => {
+  if (!feedOn()) return res.status(404).end();
+  if (!basicAuthOk(req)) {
+    res.set("WWW-Authenticate", 'Basic realm="google-ads", charset="UTF-8"');
+    return res.status(401).end();
+  }
+  return sendGoogleAdsFeed(req, res);
+});
+
 app.get("/api/google-ads/conversoes/:token.csv", rateLimit(60, 60 * 60 * 1000), async (req, res) => {
-  if (!feedTokenOk(req.params.token) || !store.enabled()) return res.status(404).end();
+  if (!feedOn() || !feedTokenOk(req.params.token)) return res.status(404).end();
+  return sendGoogleAdsFeed(req, res);
+});
+
+async function sendGoogleAdsFeed(req, res) {
   try {
     const rows = await store.googleAdsConversions(90);
     await store.markServed(rows.map((r) => r.transaction_id));
@@ -658,7 +689,7 @@ app.get("/api/google-ads/conversoes/:token.csv", rateLimit(60, 60 * 60 * 1000), 
     console.error(JSON.stringify({ evt: "db_erro", etapa: "google_ads_arquivo", erro: err.message }));
     res.status(500).end();
   }
-});
+}
 
 async function start() {
   try {

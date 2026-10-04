@@ -167,6 +167,21 @@ test("arquivo do Google Ads exige o token certo", async () => {
   assert.equal((await realFetch(`${base}/api/google-ads/conversoes/${"x".repeat(36)}.csv`)).status, 404);
 });
 
+test("arquivo do Google Ads por usuário e senha (Data Manager / HTTP Basic)", async () => {
+  const url = `${base}/api/google-ads/conversoes.csv`;
+  const auth = (u, p) => ({ headers: { Authorization: "Basic " + Buffer.from(`${u}:${p}`).toString("base64") } });
+  const sem = await realFetch(url);
+  assert.equal(sem.status, 401);
+  assert.match(sem.headers.get("www-authenticate"), /^Basic/);
+  assert.equal((await realFetch(url, auth("googleads", "errada"))).status, 401);
+  assert.equal((await realFetch(url, auth("outro", FEED_TOKEN))).status, 401);
+  const ok = await realFetch(url, auth("googleads", FEED_TOKEN));
+  assert.equal(ok.status, 200);
+  const csv = await ok.text();
+  assert.ok(csv.startsWith("order_id,gclid,gbraid,wbraid,conversion_time,conversion_value,currency\n"));
+  assert.equal(csv.trim().split("\n").length, 3, "cabeçalho + 2 vendas pagas com clique");
+});
+
 test("CSV escapa vírgulas e aspas", () => {
   const csv = mod.googleAdsCsv([{ transaction_id: 'a,"b"', gclid: null, gbraid: null, wbraid: null, paid_at: "2026-10-04T00:00:00Z", amount_cents: 100, currency: "BRL" }]);
   assert.ok(csv.includes('"a,""b"""'));
