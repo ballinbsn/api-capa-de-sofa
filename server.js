@@ -2,6 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
+const { Pool } = require("pg");
+const { createStore } = require("./db");
 
 const {
   ADEX_PUBLIC_KEY,
@@ -13,8 +15,19 @@ const {
   UTMIFY_API_TOKEN,
   UTMIFY_TEST,
   MOCK_ADEX,
+  DATABASE_URL,
+  DATABASE_SSL,
+  GOOGLE_ADS_FEED_TOKEN,
   PORT = 3000,
 } = process.env;
+
+/* Banco (Railway Postgres). Sem DATABASE_URL a API segue só em memória. */
+const store = createStore(
+  global.__TEST_DB__ || // só nos testes automatizados (test/*.test.js)
+    (DATABASE_URL
+      ? new Pool({ connectionString: DATABASE_URL, ssl: DATABASE_SSL === "true" ? { rejectUnauthorized: false } : false, max: 5 })
+      : null)
+);
 
 const ADEX_BASE = "https://api.adex.cash/functions/v1";
 const MOCK = MOCK_ADEX === "true";
@@ -258,7 +271,7 @@ async function fetchStatus(id) {
 
 /* ---------------- Rotas ---------------- */
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => res.json({ ok: true, db: store.enabled() ? "ok" : "off" }));
 
 app.post("/api/pix", rateLimit(10, 10 * 60 * 1000), async (req, res) => {
   const { order, errors } = validateOrder(req.body);
@@ -276,13 +289,31 @@ app.post("/api/pix", rateLimit(10, 10 * 60 * 1000), async (req, res) => {
         tracking,
       })
     );
+    const createdAt = new Date();
     trackedOrders.set(charge.id, {
-      createdAt: new Date(),
+      createdAt,
       order,
       tracking,
       ip: req.ip,
       feeCents: charge.feeCents || 0,
     });
+    /* Grava o pedido antes de responder: é o que permite reconhecer o webhook depois e
+       ligar a venda ao clique do Google mesmo que o cliente feche a página. */
+    try {
+      await store.insertOrder({
+        transactionId: charge.id,
+        createdAt,
+        amountCents: kitTotalCents(order.kit),
+        feeCents: charge.feeCents || 0,
+        currency: "BRL",
+        kit: order.kit,
+        customer: { name: order.name, email: order.email, phone: order.phone, cpf: order.cpf },
+        ip: req.ip,
+        tracking,
+      });
+    } catch (err) {
+      console.error(JSON.stringify({ evt: "db_erro", etapa: "insert_order", transaction_id: charge.id, erro: err.message }));
+    }
     sendUtmify(charge.id, "waiting_payment");
     res.json({
       transactionId: charge.id,
@@ -302,7 +333,7 @@ app.get("/api/pix/:id/status", rateLimit(200, 10 * 60 * 1000), async (req, res) 
   if (!UUID.test(req.params.id)) return res.status(400).json({ error: "ID inválido." });
   try {
     const status = await fetchStatus(req.params.id);
-    if (status === "paid") sendUtmify(req.params.id, "paid");
+    if (status === "paid") await handlePaid(req.params.id, new Date(), "status");
     res.json({ status });
   } catch {
     res.status(502).json({ error: "Falha ao consultar o pagamento." });
@@ -322,25 +353,75 @@ function validSignature(req) {
   });
 }
 
-app.post("/api/webhook", (req, res) => {
+/* Pedido criado por esta API? (banco; se o banco estiver fora, a memória do processo).
+   A conta da ADEX manda para este webhook pagamentos de OUTRAS ofertas: esses não são
+   vendas desta loja e não podem ir para a UTMify nem virar conversão no Google Ads. */
+async function isOurOrder(id) {
+  if (trackedOrders.has(id)) return true;
+  try {
+    return !!(await store.getOrder(id));
+  } catch (err) {
+    console.error(JSON.stringify({ evt: "db_erro", etapa: "get_order", transaction_id: id, erro: err.message }));
+    return false;
+  }
+}
+
+/* Pagamento confirmado (webhook charge.paid ou consulta de status). Idempotente:
+   grava paid_at uma vez só; a UTMify recebe "paid" uma vez só. */
+async function handlePaid(id, paidAt, origem) {
+  if (!(await isOurOrder(id))) return false;
+  let first = null;
+  try {
+    first = await store.markPaid(id, paidAt);
+  } catch (err) {
+    console.error(JSON.stringify({ evt: "db_erro", etapa: "mark_paid", transaction_id: id, erro: err.message }));
+  }
+  const mem = trackedOrders.get(id);
+  if (mem && !mem.approvedAt) mem.approvedAt = paidAt;
+  if (first) console.log(JSON.stringify({ evt: "venda_paga", transaction_id: id, origem, paid_at: paidAt.toISOString() }));
+  await sendUtmify(id, "paid");
+  return true;
+}
+
+app.post("/api/webhook", async (req, res) => {
   if (ADEX_WEBHOOK_SECRET && !validSignature(req)) {
     return res.status(401).json({ error: "Assinatura inválida" });
   }
   const { event, data } = req.body || {};
+  const txId = data && (data.transaction_id || data.id || (data.transaction && data.transaction.id));
+  const ours = txId ? await isOurOrder(String(txId)) : false;
   console.log(
     JSON.stringify({
-      evt: "webhook",
+      evt: ours ? "webhook" : "webhook_ignorado",
+      motivo: ours ? undefined : "pedido nao criado por esta API (outra oferta da conta ADEX)",
       event,
-      transaction_id: data && data.transaction_id,
+      transaction_id: txId,
       status: data && data.status,
       amount: data && data.amount,
     })
   );
-  const txId = data && (data.transaction_id || data.id || (data.transaction && data.transaction.id));
-  const utmifyStatus =
+  if (!ours) return res.status(200).json({ received: true, ignored: true });
+
+  const id = String(txId);
+  const ts = req.body.timestamp && !Number.isNaN(Date.parse(req.body.timestamp)) ? new Date(req.body.timestamp) : new Date();
+  const kind =
     { "charge.paid": "paid", "charge.refunded": "refunded", "charge.chargeback": "chargedback", "charge.failed": "refused" }[event] ||
     { paid: "paid", refunded: "refunded" }[data && data.status];
-  if (txId && utmifyStatus) sendUtmify(txId, utmifyStatus, orderFromWebhook(data, req.body.timestamp));
+  try {
+    if (kind === "paid") await handlePaid(id, ts, "webhook");
+    else if (kind === "refunded" || kind === "chargedback") {
+      try {
+        await store.markRefunded(id, kind, ts);
+      } catch (err) {
+        console.error(JSON.stringify({ evt: "db_erro", etapa: "mark_refunded", transaction_id: id, erro: err.message }));
+      }
+      const mem = trackedOrders.get(id);
+      if (mem && !mem.refundedAt) mem.refundedAt = ts;
+      await sendUtmify(id, kind);
+    } else if (kind === "refused") await sendUtmify(id, kind);
+  } catch (err) {
+    console.error(JSON.stringify({ evt: "webhook_erro", transaction_id: id, erro: err.message }));
+  }
   res.status(200).json({ received: true });
 });
 
@@ -366,38 +447,70 @@ setInterval(() => {
 
 const utcStamp = (d) => d.toISOString().slice(0, 19).replace("T", " ");
 
-/* Pedido reconstruído a partir do webhook da ADEX, para o caso do servidor ter
-   reiniciado entre a geração do Pix e o pagamento (pedido não está mais em memória). */
-function orderFromWebhook(data, timestamp) {
-  const fee = Number(data.fee_amount) || 0;
-  const amount = Number(data.amount) || 0;
-  const t = timestamp && !Number.isNaN(Date.parse(timestamp)) ? new Date(timestamp) : new Date();
+/* Pedido a partir do banco (servidor reiniciou entre o Pix e o pagamento). */
+function orderFromRow(row) {
   return {
-    createdAt: t,
-    order: {
-      name: data.customer_name || "Cliente",
-      email: data.customer_email || "cliente@example.com",
-      phone: data.customer_phone || "",
-      cpf: data.customer_document || "",
-      kit: null,
-      totalCents: ADEX_AMOUNT_UNIT === "cents" ? Math.round(amount) : Math.round(amount * 100),
+    createdAt: new Date(row.created_at),
+    approvedAt: row.paid_at ? new Date(row.paid_at) : null,
+    refundedAt: row.refunded_at ? new Date(row.refunded_at) : null,
+    order: Object.assign({}, row.customer || {}, { kit: row.kit || null, totalCents: row.amount_cents }),
+    tracking: {
+      src: row.src, sck: row.sck, utm_source: row.utm_source, utm_campaign: row.utm_campaign,
+      utm_medium: row.utm_medium, utm_content: row.utm_content, utm_term: row.utm_term,
     },
-    tracking: {},
-    ip: null,
-    feeCents: Number.isInteger(fee) && fee > 100 ? fee : Math.round(fee * 100),
+    ip: row.ip,
+    feeCents: row.fee_cents || 0,
   };
 }
 
-async function sendUtmify(id, status, fallbackOrder) {
-  if (!UTMIFY_API_TOKEN) return;
+async function loadOrder(id) {
   let o = trackedOrders.get(id);
-  if (!o && fallbackOrder) {
-    o = fallbackOrder;
-    trackedOrders.set(id, o);
+  if (o) return o;
+  try {
+    const row = await store.getOrder(id);
+    if (row) {
+      o = orderFromRow(row);
+      trackedOrders.set(id, o);
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ evt: "db_erro", etapa: "load_order", transaction_id: id, erro: err.message }));
+  }
+  return o || null;
+}
+
+/* Reserva o envio (banco quando disponível; senão memória). true = pode enviar. */
+async function claimUtmify(id, status) {
+  try {
+    const r = await store.claimUtmify(id, status);
+    if (r !== null) return r;
+  } catch (err) {
+    console.error(JSON.stringify({ evt: "db_erro", etapa: "claim_utmify", transaction_id: id, erro: err.message }));
   }
   const key = id + ":" + status;
-  if (!o || utmifySent.has(key)) return;
+  if (utmifySent.has(key)) return false;
   utmifySent.add(key);
+  return true;
+}
+
+async function releaseUtmify(id, status) {
+  utmifySent.delete(id + ":" + status);
+  try {
+    await store.releaseUtmify(id, status);
+  } catch (err) {
+    console.error(JSON.stringify({ evt: "db_erro", etapa: "release_utmify", transaction_id: id, erro: err.message }));
+  }
+}
+
+async function sendUtmify(id, status) {
+  if (!UTMIFY_API_TOKEN) return;
+  const o = await loadOrder(id);
+  if (!o) return; // só pedidos desta loja
+  if (!o.ip) {
+    /* A UTMify exige o IP do comprador. Não inventamos um: o envio é pulado e registrado. */
+    console.log(JSON.stringify({ evt: "utmify_pulado", transaction_id: id, status, motivo: "pedido sem IP do comprador" }));
+    return;
+  }
+  if (!(await claimUtmify(id, status))) return;
   if (status === "paid" && !o.approvedAt) o.approvedAt = new Date();
   if ((status === "refunded" || status === "chargedback") && !o.refundedAt) o.refundedAt = new Date();
   if (o.refundedAt && !o.approvedAt) o.approvedAt = o.createdAt;
@@ -473,20 +586,90 @@ async function sendUtmify(id, status, fallbackOrder) {
     console.log(
       JSON.stringify({ evt: "utmify", transaction_id: id, status, isTest, http: res.status, resposta: text.slice(0, 300) })
     );
-    if (!res.ok) utmifySent.delete(key);
+    if (!res.ok) await releaseUtmify(id, status);
   } catch (err) {
-    utmifySent.delete(key);
+    await releaseUtmify(id, status);
     console.error("UTMify falhou", id, status, err && err.message);
   }
 }
 
+/* Identificadores de clique do Google: só caracteres que eles usam de fato. */
+const CLICK_ID = /^[A-Za-z0-9_\-.]{10,512}$/;
+
 function sanitizeTracking(t) {
-  const keys = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "src", "sck", "fbclid", "gclid", "ttclid"];
+  const keys = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "src", "sck", "fbclid", "ttclid"];
   const out = {};
   keys.forEach((k) => {
-    if (t && typeof t[k] === "string") out[k] = t[k].slice(0, 200);
+    if (t && typeof t[k] === "string" && t[k]) out[k] = t[k].slice(0, 200);
+  });
+  ["gclid", "gbraid", "wbraid"].forEach((k) => {
+    if (t && typeof t[k] === "string" && CLICK_ID.test(t[k])) out[k] = t[k];
   });
   return out;
 }
 
-app.listen(PORT, () => console.log(`api-capa-de-sofa na porta ${PORT}${MOCK ? " (MOCK)" : ""}`));
+/* ---------------- Google Ads: arquivo de conversões (Data Manager / importação programada) ----------------
+   Lista as vendas PAGAS desta loja (confirmadas pela ADEX) que têm gclid/gbraid/wbraid,
+   dos últimos 90 dias. O Google Ads lê este arquivo por HTTPS em horário programado.
+   Sem dados pessoais. O Google descarta repetições (mesma ação + data/hora + identificador)
+   e o Order ID impede contar a mesma venda duas vezes. Protegido por um token longo na URL
+   (variável GOOGLE_ADS_FEED_TOKEN, mínimo 32 caracteres); sem ele a rota não existe. */
+
+const csvCell = (v) => {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+function googleAdsCsv(rows) {
+  const header = ["order_id", "gclid", "gbraid", "wbraid", "conversion_time", "conversion_value", "currency"];
+  const lines = rows.map((r) =>
+    [
+      r.transaction_id,
+      r.gclid,
+      r.gbraid,
+      r.wbraid,
+      new Date(r.paid_at).toISOString().replace(/\.\d{3}Z$/, "Z"),
+      (r.amount_cents / 100).toFixed(2),
+      r.currency || "BRL",
+    ]
+      .map(csvCell)
+      .join(",")
+  );
+  return [header.join(","), ...lines].join("\n") + "\n";
+}
+
+function feedTokenOk(given) {
+  if (!GOOGLE_ADS_FEED_TOKEN || GOOGLE_ADS_FEED_TOKEN.length < 32) return false;
+  const a = Buffer.from(String(given || ""));
+  const b = Buffer.from(GOOGLE_ADS_FEED_TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+app.get("/api/google-ads/conversoes/:token.csv", rateLimit(60, 60 * 60 * 1000), async (req, res) => {
+  if (!feedTokenOk(req.params.token) || !store.enabled()) return res.status(404).end();
+  try {
+    const rows = await store.googleAdsConversions(90);
+    await store.markServed(rows.map((r) => r.transaction_id));
+    console.log(JSON.stringify({ evt: "google_ads_arquivo_lido", linhas: rows.length, ua: String(req.headers["user-agent"] || "").slice(0, 80) }));
+    res.set("Content-Type", "text/csv; charset=utf-8");
+    res.set("Cache-Control", "no-store");
+    res.send(googleAdsCsv(rows));
+  } catch (err) {
+    console.error(JSON.stringify({ evt: "db_erro", etapa: "google_ads_arquivo", erro: err.message }));
+    res.status(500).end();
+  }
+});
+
+async function start() {
+  try {
+    if (await store.init()) console.log(JSON.stringify({ evt: "db_pronto" }));
+    else console.log(JSON.stringify({ evt: "db_desligado", motivo: "DATABASE_URL não definida (só memória)" }));
+  } catch (err) {
+    console.error(JSON.stringify({ evt: "db_erro", etapa: "init", erro: err.message }));
+  }
+  return app.listen(PORT, () => console.log(`api-capa-de-sofa na porta ${PORT}${MOCK ? " (MOCK)" : ""}`));
+}
+
+if (require.main === module) start();
+
+module.exports = { app, store, start, googleAdsCsv, sanitizeTracking, trackedOrders };

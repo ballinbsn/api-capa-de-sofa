@@ -45,3 +45,10 @@ npm run dev
 3. Settings → Networking → Generate Domain (porta 8080). Essa URL vai em `PUBLIC_API_URL` e em `API_URL` (`assets/checkout/config.js` do site).
 4. Painel ADEX → Webhooks: cadastre `https://SUA-URL/api/webhook` e copie o segredo para `ADEX_WEBHOOK_SECRET`.
 5. Faça uma compra de teste (chaves `test`) e confira o valor cobrado.
+
+## Banco e Google Ads (desde 04/10/2026)
+
+- **Fonte da verdade da compra = webhook `charge.paid` da ADEX.** Pedido só vira venda se foi criado por esta API (webhooks de outras ofertas da mesma conta ADEX são ignorados e registrados como `webhook_ignorado`).
+- **PostgreSQL** (`DATABASE_URL`): tabela `orders` criada sozinha na inicialização. Guarda transaction_id, gclid/gbraid/wbraid, UTMs, valor, moeda, criação, pagamento, status e envios (UTMify / Google Ads). Pagamento e envios são idempotentes.
+- **Google Ads**: `GET /api/google-ads/conversoes/<GOOGLE_ADS_FEED_TOKEN>.csv` lista as vendas pagas com clique do Google dos últimos 90 dias (colunas `order_id,gclid,gbraid,wbraid,conversion_time,conversion_value,currency`, horário em UTC, sem dados pessoais). Lido pelo Google Ads Data Manager (importação programada por HTTPS) para a ação de conversão de compra importada.
+- **Testes**: `npm test` (PostgreSQL real em memória via PGlite + ADEX simulada; nada sai para a internet).
