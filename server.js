@@ -642,30 +642,37 @@ function googleAdsCsv(rows) {
   return [header.join(","), ...lines].join("\n") + "\n";
 }
 
+const FEED_TOKEN = String(GOOGLE_ADS_FEED_TOKEN || "").trim(); // ignora espaço/quebra de linha colados por engano
+
 function feedTokenOk(given) {
-  if (!GOOGLE_ADS_FEED_TOKEN || GOOGLE_ADS_FEED_TOKEN.length < 32) return false;
-  const a = Buffer.from(String(given || ""));
-  const b = Buffer.from(GOOGLE_ADS_FEED_TOKEN);
+  if (FEED_TOKEN.length < 32) return false;
+  const a = Buffer.from(String(given || "").trim());
+  const b = Buffer.from(FEED_TOKEN);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function basicAuthOk(req) {
+/* Devolve "" se usuário e senha conferem; senão o motivo (vai para o log, nunca a senha). */
+function basicAuthProblem(req) {
   const m = /^Basic\s+(.+)$/i.exec(String(req.headers.authorization || ""));
-  if (!m) return false;
+  if (!m) return req.headers.authorization ? "esquema_nao_basic" : "sem_autorizacao";
   const raw = Buffer.from(m[1], "base64").toString("utf8");
   const i = raw.indexOf(":");
-  if (i < 0) return false;
-  const ua = Buffer.from(raw.slice(0, i));
-  const ub = Buffer.from(GOOGLE_ADS_FEED_USER);
-  const userOk = ua.length === ub.length && crypto.timingSafeEqual(ua, ub);
-  return feedTokenOk(raw.slice(i + 1)) && userOk;
+  if (i < 0) return "formato_invalido";
+  const ua = Buffer.from(raw.slice(0, i).trim());
+  const ub = Buffer.from(GOOGLE_ADS_FEED_USER.trim());
+  if (!(ua.length === ub.length && crypto.timingSafeEqual(ua, ub))) return "usuario_errado";
+  const pass = raw.slice(i + 1).trim();
+  if (pass.length !== FEED_TOKEN.length) return `senha_tamanho_${pass.length}_esperado_${FEED_TOKEN.length}`;
+  return feedTokenOk(pass) ? "" : "senha_errada";
 }
 
-const feedOn = () => !!GOOGLE_ADS_FEED_TOKEN && GOOGLE_ADS_FEED_TOKEN.length >= 32 && store.enabled();
+const feedOn = () => FEED_TOKEN.length >= 32 && store.enabled();
 
 app.get("/api/google-ads/conversoes.csv", rateLimit(60, 60 * 60 * 1000), async (req, res) => {
   if (!feedOn()) return res.status(404).end();
-  if (!basicAuthOk(req)) {
+  const problem = basicAuthProblem(req);
+  if (problem) {
+    console.log(JSON.stringify({ evt: "google_ads_acesso_negado", motivo: problem, ua: String(req.headers["user-agent"] || "").slice(0, 80) }));
     res.set("WWW-Authenticate", 'Basic realm="google-ads", charset="UTF-8"');
     return res.status(401).end();
   }
