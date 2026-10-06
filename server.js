@@ -624,21 +624,26 @@ const csvCell = (v) => {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
+/* Um identificador de clique por venda: gclid se houver, senão gbraid, senão wbraid.
+   O Google recusa a linha quando gbraid e wbraid vêm juntos; com o gclid presente os outros não acrescentam nada. */
+const clickId = (r) => (r.gclid ? { gclid: r.gclid } : r.gbraid ? { gbraid: r.gbraid } : { wbraid: r.wbraid });
+
 function googleAdsCsv(rows) {
   const header = ["order_id", "gclid", "gbraid", "wbraid", "conversion_time", "conversion_value", "currency"];
-  const lines = rows.map((r) =>
-    [
+  const lines = rows.map((r) => {
+    const c = clickId(r);
+    return [
       r.transaction_id,
-      r.gclid,
-      r.gbraid,
-      r.wbraid,
+      c.gclid,
+      c.gbraid,
+      c.wbraid,
       new Date(r.paid_at).toISOString().replace(/\.\d{3}Z$/, "Z"),
       (r.amount_cents / 100).toFixed(2),
       r.currency || "BRL",
     ]
       .map(csvCell)
-      .join(",")
-  );
+      .join(",");
+  });
   return [header.join(","), ...lines].join("\n") + "\n";
 }
 

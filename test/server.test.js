@@ -182,6 +182,20 @@ test("arquivo do Google Ads por usuário e senha (Data Manager / HTTP Basic)", a
   assert.equal(csv.trim().split("\n").length, 3, "cabeçalho + 2 vendas pagas com clique");
 });
 
+test("arquivo do Google Ads manda um identificador de clique por venda (gclid > gbraid > wbraid)", () => {
+  const base = { paid_at: "2026-10-06T17:13:54Z", amount_cents: 8790, currency: "BRL" };
+  const csv = mod.googleAdsCsv([
+    { ...base, transaction_id: "a", gclid: "G1234567890", gbraid: "B1234567890", wbraid: null },
+    { ...base, transaction_id: "b", gclid: null, gbraid: "B1234567890", wbraid: "W1234567890" },
+    { ...base, transaction_id: "c", gclid: null, gbraid: null, wbraid: "W1234567890" },
+  ]).trim().split("\n").slice(1);
+  assert.deepEqual(csv.map((l) => l.split(",").slice(0, 4)), [
+    ["a", "G1234567890", "", ""],
+    ["b", "", "B1234567890", ""],
+    ["c", "", "", "W1234567890"],
+  ]);
+});
+
 test("CSV escapa vírgulas e aspas", () => {
   const csv = mod.googleAdsCsv([{ transaction_id: 'a,"b"', gclid: null, gbraid: null, wbraid: null, paid_at: "2026-10-04T00:00:00Z", amount_cents: 100, currency: "BRL" }]);
   assert.ok(csv.includes('"a,""b"""'));
